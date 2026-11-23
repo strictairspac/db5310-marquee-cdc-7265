@@ -12,6 +12,8 @@ _IDENTIFIER = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}')
 _ENVELOPE = ('seq', 'event_id', 'sign_id', 'operation', 'content')
 _OPERATIONS = {'put': '更新牌面', 'delete': '撤下牌面'}
 _STATES = {'pending': '暂缓', 'applied': '已提交', 'conflict': '矛盾隔离', 'history': '历史未核实'}
+_LEDGER_LIMIT = 1000
+_SIGN_LIMIT = 1000
 
 
 def _sample_event(batch, stream, sequence, sign_id, content, operation='put'):
@@ -19,17 +21,23 @@ def _sample_event(batch, stream, sequence, sign_id, content, operation='put'):
                 sign_id=sign_id, operation=operation, content=content)
 
 
+def _sample_ledger(stream, sequence, *signs):
+    return dict(stream=stream, sequence=sequence,
+                signs=[dict(sign_id=sign_id, content=content) for sign_id, content in signs])
+
+
 SPEC = {
     'name': '灯窗市集 08:00 开市牌面发布',
-    'summary': '按档口流的连续序号发布牌面更新，保留缺位与矛盾的证据。',
+    'summary': '按档口流的连续序号发布牌面更新，保留缺位、矛盾与盘点差额的证据。',
     'customer': '灯窗市集·营运发布组',
     'entity_labels': ['牌面回放档案', '断点续放', '牌面发布单'],
     'field_labels': {
         'checkpoints': '起始消费位点', 'snapshot': '位点对应的在用牌面快照', 'events': '到货事件',
-        'stream': '分区流', 'sequence': '流内序号', 'batch': '到货批号', 'event_id': '事件编号',
-        'sign_id': '牌面编号', 'operation': '动作（put / delete）', 'content': '牌面内容',
+        'ledgers': '上游盘点账', 'stream': '分区流', 'sequence': '流内序号', 'batch': '到货批号',
+        'event_id': '事件编号', 'sign_id': '牌面编号', 'operation': '动作（put / delete）',
+        'content': '牌面内容', 'signs': '整区在用牌面',
     },
-    'guidance': '录入昨夜位点与完整牌面快照，再按交付次序填写到货批号。同批允许乱序，撤牌动作填 delete，内容留空。',
+    'guidance': '录入昨夜位点与完整牌面快照，再按交付次序填写到货批号。每张盘点账登记一个分区流的位点和该位点的整区在用牌面，按位点逐点核对。同批允许乱序，撤牌动作填 delete，内容留空。',
     'sample': {
         'checkpoints': [
             {'stream': 'NORTH', 'sequence': 12},
@@ -55,14 +63,26 @@ SPEC = {
             _sample_event(3, 'SOUTH', 5, 'S-02', '烤梨｜15元'),
             _sample_event(3, 'NORTH', 14, 'N-07', '桂花米酿｜18元'),
         ],
+        'ledgers': [
+            _sample_ledger('NORTH', 12, ('N-07', '桂花米酿｜22元'), ('N-08', '青团｜12元')),
+            _sample_ledger('NORTH', 13, ('N-07', '桂花米酿｜22元')),
+            _sample_ledger('NORTH', 14, ('N-07', '桂花米酿｜18元')),
+            _sample_ledger('SOUTH', 5, ('S-02', '烤梨｜14元')),
+            _sample_ledger('WEST', 1, ('W-03', '冰粉｜10元')),
+            _sample_ledger('WEST', 2),
+        ],
     },
     'expect': {'已提交事件数': 5, '重投忽略数': 2, '矛盾隔离事件数': 3, '历史未核实数': 0,
-               '暂缓事件数': 2, '缺口流数': 1, '矛盾阻塞流数': 1, '在用牌面数': 2},
+               '暂缓事件数': 2, '缺口流数': 1, '矛盾阻塞流数': 1, '在用牌面数': 2,
+               '盘点账数': 6, '盘点一致数': 6, '盘点差额数': 0, '待核盘点数': 0,
+               '缺牌项数': 0, '多牌项数': 0, '文案差异项数': 0},
 }
 
 
-def _rows(payload, key, limit):
+def _rows(payload, key, limit, required=True):
     value = payload.get(key)
+    if value is None and not required:
+        return []
     if not isinstance(value, list) or len(value) > limit or any(not isinstance(row, dict) for row in value):
         raise ValueError(f'「{SPEC["field_labels"][key]}」需为最多 {limit} 行的对象数组')
     return value
@@ -94,6 +114,23 @@ def _content(row, operation, label):
         value.encode('utf-8')
     except UnicodeEncodeError:
         raise ValueError(f'{label}的牌面内容包含无效的 Unicode 字符') from None
+
+
+def _signs(row, label):
+    value = row.get('signs')
+    if not isinstance(value, list) or len(value) > _SIGN_LIMIT or any(not isinstance(sign, dict) for sign in value):
+        raise ValueError(f'{label}的「{SPEC["field_labels"]["signs"]}」需为最多 {_SIGN_LIMIT} 行的对象数组')
+    seen = set()
+    result = []
+    for index, sign in enumerate(value, 1):
+        sign_label = f'{label}牌面第 {index} 行'
+        sign_id = _identifier(sign, 'sign_id', sign_label)
+        _content(sign, 'put', sign_label)
+        if sign_id in seen:
+            raise ValueError(f'{sign_label}的牌面 {sign_id} 重复')
+        seen.add(sign_id)
+        result.append({'sign_id': sign_id, 'content': sign['content']})
+    return result
 
 
 def validate(payload):
@@ -135,6 +172,30 @@ def validate(payload):
         if operation not in ('put', 'delete'):
             raise ValueError(f'{label}的动作须为 put 或 delete')
         _content(row, operation, label)
+
+    ledger_keys = set()
+    for index, row in enumerate(_rows(payload, 'ledgers', _LEDGER_LIMIT, required=False), 1):
+        label = f'盘点账第 {index} 行'
+        stream = _identifier(row, 'stream', label)
+        if stream not in offsets:
+            raise ValueError(f'{label}的流 {stream} 缺少起始位点')
+        sequence = _number(row, 'sequence', 0, label)
+        if (stream, sequence) in ledger_keys:
+            raise ValueError(f'{label}的分区 {stream} 序号 {sequence} 已登记盘点账')
+        ledger_keys.add((stream, sequence))
+        _signs(row, label)
+
+
+def validate_ledger(ledger, payload):
+    if not isinstance(ledger, dict):
+        raise ValueError('补交盘点账需为对象')
+    offsets = {row['stream']: row['sequence'] for row in payload['checkpoints']}
+    label = '补交盘点账'
+    stream = _identifier(ledger, 'stream', label)
+    if stream not in offsets:
+        raise ValueError(f'{label}的流 {stream} 缺少起始位点')
+    sequence = _number(ledger, 'sequence', 0, label)
+    return {'stream': stream, 'sequence': sequence, 'signs': _signs(ledger, label)}
 
 
 def _stage(conn, event, offset):
@@ -210,8 +271,7 @@ def _event_row(event):
             '依据': event['reason'] or ('已随位点提交' if state == 'applied' else '等待本流解除前序阻塞')}
 
 
-def solve(payload, engine):
-    validate(payload)
+def _execute(payload, engine):
     duplicates = []
     progress = []
     with store.isolated_replay(engine) as conn:
@@ -221,30 +281,196 @@ def solve(payload, engine):
             duplicates.extend(repeated)
             progress.extend(committed)
         with conn.begin():
-            offsets = [_offset_row(stream, offset, store.waiting_events(conn, stream, offset))
-                       for stream, offset in store.read_offsets(conn).items()]
+            offsets = dict(store.read_offsets(conn))
+            offset_rows = [_offset_row(stream, offset, store.waiting_events(conn, stream, offset))
+                           for stream, offset in offsets.items()]
             signs = [{'分区流': row['stream'], '牌面编号': row['sign_id'],
                       '当前内容': row['content'], '来源序号': row['seq']} for row in store.read_projection(conn)]
             journal = store.read_journal(conn)
-    events = [_event_row(event) for event in sorted([*journal, *duplicates], key=itemgetter('batch_no', 'receipt'))]
+    return {'offsets': offsets, 'offset_rows': offset_rows, 'signs': signs,
+            'journal': journal, 'duplicates': duplicates, 'progress': progress}
+
+
+def _applied_by_stream(journal):
+    groups = {}
+    for row in journal:
+        if row['state'] != 'applied':
+            continue
+        groups.setdefault(row['stream'], []).append(row)
+    for rows in groups.values():
+        rows.sort(key=itemgetter('seq'))
+    return groups
+
+
+def _projection_at(stream, target, snapshot, applied):
+    state = {}
+    for row in snapshot:
+        if row['stream'] == stream and row['sequence'] <= target:
+            state[row['sign_id']] = row['content']
+    for event in applied.get(stream, ()):
+        if event['seq'] > target:
+            break
+        if event['operation'] == 'delete':
+            state.pop(event['sign_id'], None)
+        else:
+            state[event['sign_id']] = event['content']
+    return state
+
+
+def _evaluate_ledger(ledger, offsets, snapshot, applied, checkpoints):
+    stream = ledger['stream']
+    sequence = ledger['sequence']
+    offset = offsets.get(stream, 0)
+    if sequence > offset:
+        return {'stream': stream, 'sequence': sequence, 'status': '待核', 'diffs': [],
+                'reason': f'流 {stream} 位点 {offset}，盘点序号 {sequence} 尚未到货'}
+    checkpoint = checkpoints.get(stream, 0)
+    if sequence < checkpoint:
+        return {'stream': stream, 'sequence': sequence, 'status': '待核', 'diffs': [],
+                'reason': f'盘点序号早于起始位点 {checkpoint}，缺少当时的整区牌面快照'}
+    state = _projection_at(stream, sequence, snapshot, applied)
+    ledger_signs = {sign['sign_id']: sign['content'] for sign in ledger['signs']}
+    diffs = []
+    for sign_id in sorted(ledger_signs):
+        if sign_id not in state:
+            diffs.append({'kind': '缺牌', 'sign_id': sign_id,
+                          'ledger_content': ledger_signs[sign_id], 'release_content': ''})
+        elif state[sign_id] != ledger_signs[sign_id]:
+            diffs.append({'kind': '文案差异', 'sign_id': sign_id,
+                          'ledger_content': ledger_signs[sign_id], 'release_content': state[sign_id]})
+    for sign_id in sorted(state):
+        if sign_id not in ledger_signs:
+            diffs.append({'kind': '多牌', 'sign_id': sign_id,
+                          'ledger_content': '', 'release_content': state[sign_id]})
+    status = '差额' if diffs else '一致'
+    reason = '整区牌面与发布单一致' if not diffs else f'整区牌面存在 {len(diffs)} 处差异'
+    return {'stream': stream, 'sequence': sequence, 'status': status, 'reason': reason, 'diffs': diffs}
+
+
+def _ledgers(payload):
+    return [{'stream': row['stream'], 'sequence': row['sequence'],
+             'signs': [{'sign_id': sign['sign_id'], 'content': sign['content']} for sign in row['signs']]}
+            for row in (payload.get('ledgers') or [])]
+
+
+def _entries_for(payload, result):
+    applied = _applied_by_stream(result['journal'])
+    checkpoints = {row['stream']: row['sequence'] for row in payload['checkpoints']}
+    snapshot = payload.get('snapshot') or []
+    return [_evaluate_ledger(ledger, result['offsets'], snapshot, applied, checkpoints)
+            for ledger in _ledgers(payload)]
+
+
+def _inventory_parts(entries):
+    ledger_rows = []
+    diff_rows = []
+    counts = {'盘点账数': len(entries), '盘点一致数': 0, '盘点差额数': 0, '待核盘点数': 0,
+              '缺牌项数': 0, '多牌项数': 0, '文案差异项数': 0}
+    for entry in entries:
+        missing = sum(diff['kind'] == '缺牌' for diff in entry['diffs'])
+        extra = sum(diff['kind'] == '多牌' for diff in entry['diffs'])
+        text = sum(diff['kind'] == '文案差异' for diff in entry['diffs'])
+        counts['缺牌项数'] += missing
+        counts['多牌项数'] += extra
+        counts['文案差异项数'] += text
+        if entry['status'] == '一致':
+            counts['盘点一致数'] += 1
+        elif entry['status'] == '差额':
+            counts['盘点差额数'] += 1
+        else:
+            counts['待核盘点数'] += 1
+        ledger_rows.append({'分区流': entry['stream'], '盘点序号': entry['sequence'],
+                            '核对状态': entry['status'], '缺牌数': missing, '多牌数': extra,
+                            '文案差异项数': text, '依据': entry['reason']})
+        for diff in entry['diffs']:
+            diff_rows.append({'分区流': entry['stream'], '盘点序号': entry['sequence'],
+                              '差异类型': diff['kind'], '牌面编号': diff['sign_id'],
+                              '盘点内容': diff['ledger_content'], '发布单内容': diff['release_content']})
+    return ledger_rows, diff_rows, counts
+
+
+def _blockers(entries):
+    blockers = []
+    for entry in entries:
+        if entry['status'] == '差额':
+            blockers.append(f'分区 {entry["stream"]} 序号 {entry["sequence"]} 盘点存在差额')
+        elif entry['status'] == '待核':
+            blockers.append(f'分区 {entry["stream"]} 序号 {entry["sequence"]} 盘点待核')
+    return blockers
+
+
+def _section(base, title):
+    for section in base.get('sections') or []:
+        if section.get('title') == title:
+            return section
+    return {'title': title, 'rows': []}
+
+
+def _summary(metrics):
+    return (f'本轮提交 {metrics.get("已提交事件数", 0)} 条变更，发布单有 {metrics.get("在用牌面数", 0)} 块在用牌面。'
+            f'共核对 {metrics.get("盘点账数", 0)} 张盘点账：{metrics.get("盘点差额数", 0)} 张有差额，'
+            f'{metrics.get("待核盘点数", 0)} 张待核。'
+            f'{metrics.get("缺口流数", 0)} 条流待补号，{metrics.get("矛盾阻塞流数", 0)} 条流待核对矛盾事件。')
+
+
+def _compose(base, entries):
+    metrics = dict(base.get('metrics') or {})
+    ledger_rows, diff_rows, counts = _inventory_parts(entries)
+    metrics.update(counts)
+    blockers = _blockers(entries)
+    return {
+        'summary': _summary(metrics),
+        'metrics': metrics,
+        'signable': not blockers,
+        'blockers': blockers,
+        'sections': [
+            _section(base, '牌面发布单'),
+            {'title': '盘点账核对', 'rows': ledger_rows},
+            {'title': '盘点差异明细', 'rows': diff_rows},
+            _section(base, '消费位点与首个阻塞'),
+            _section(base, '分批推进记录'),
+            _section(base, '事件接收与处置'),
+        ],
+        'inventory': {'entries': entries},
+    }
+
+
+def solve(payload, engine):
+    validate(payload)
+    result = _execute(payload, engine)
+    journal = result['journal']
+    events = [_event_row(event) for event in
+              sorted([*journal, *result['duplicates']], key=itemgetter('batch_no', 'receipt'))]
     metrics = {
         '已提交事件数': sum(row['state'] == 'applied' for row in journal),
-        '重投忽略数': len(duplicates),
+        '重投忽略数': len(result['duplicates']),
         '矛盾隔离事件数': sum(row['state'] == 'conflict' for row in journal),
         '历史未核实数': sum(row['state'] == 'history' for row in journal),
         '暂缓事件数': sum(row['state'] == 'pending' for row in journal),
-        '缺口流数': sum(row['续放状态'] == '缺号待补' for row in offsets),
-        '矛盾阻塞流数': sum(row['续放状态'] == '矛盾待核' for row in offsets),
-        '在用牌面数': len(signs),
+        '缺口流数': sum(row['续放状态'] == '缺号待补' for row in result['offset_rows']),
+        '矛盾阻塞流数': sum(row['续放状态'] == '矛盾待核' for row in result['offset_rows']),
+        '在用牌面数': len(result['signs']),
     }
-    return {
-        'summary': (f'本轮提交 {metrics["已提交事件数"]} 条变更，发布单有 {len(signs)} 块在用牌面。'
-                    f'{metrics["缺口流数"]} 条流待补号，{metrics["矛盾阻塞流数"]} 条流待核对矛盾事件。'),
-        'metrics': metrics,
-        'sections': [
-            {'title': '牌面发布单', 'rows': signs},
-            {'title': '消费位点与首个阻塞', 'rows': offsets},
-            {'title': '分批推进记录', 'rows': progress},
-            {'title': '事件接收与处置', 'rows': events},
-        ],
-    }
+    base = {'metrics': metrics, 'sections': [
+        {'title': '牌面发布单', 'rows': result['signs']},
+        {'title': '消费位点与首个阻塞', 'rows': result['offset_rows']},
+        {'title': '分批推进记录', 'rows': result['progress']},
+        {'title': '事件接收与处置', 'rows': events},
+    ]}
+    return _compose(base, _entries_for(payload, result))
+
+
+def check_late_ledger(payload, ledger, engine):
+    normalized = validate_ledger(ledger, payload)
+    result = _execute(payload, engine)
+    applied = _applied_by_stream(result['journal'])
+    checkpoints = {row['stream']: row['sequence'] for row in payload['checkpoints']}
+    entry = _evaluate_ledger(normalized, result['offsets'], payload.get('snapshot') or [],
+                             applied, checkpoints)
+    entry['signs'] = normalized['signs']
+    return entry
+
+
+def append_ledger(report, entry):
+    entries = list((report.get('inventory') or {}).get('entries') or []) + [entry]
+    return _compose(report, entries)

@@ -6,7 +6,7 @@ from sqlalchemy import and_, or_, select
 
 from src.config.settings import cache, engine
 from src.constants.workflow import Status
-from src.models.tables import audit, cases, evidence, runs
+from src.models.tables import audit, cases, evidence, inventory_ledgers, runs
 from src.services import domain
 from src.utils.encoding import canonical
 from src.utils.time import utc_time
@@ -90,15 +90,71 @@ def finish(run_id, token, result=None, error=None):
         log(conn, 'worker', status.value, run_id)
 
 
+def _evidence_case(conn, row):
+    run = conn.execute(select(runs).where(runs.c.id == row['run_id'])).mappings().first()
+    if run is None:
+        raise HTTPException(404, '找不到该证据对应的执行')
+    case = conn.execute(select(cases).where(cases.c.id == run['case_id'])).mappings().first()
+    if case is None:
+        raise HTTPException(404, '找不到该证据对应的档案')
+    return case['payload']
+
+
+def _lock_evidence(conn, identity):
+    row = conn.execute(select(evidence).where(evidence.c.id == identity).with_for_update()).mappings().first()
+    if row is None:
+        raise HTTPException(404, '找不到该记录')
+    return row
+
+
 def review(identity, note, actor):
     note = note.strip()
     if not note:
         raise HTTPException(422, '复核意见不能为空')
     with engine.begin() as conn:
-        found(conn, evidence, identity)
-        count = conn.execute(evidence.update().where(evidence.c.id == identity, evidence.c.reviewed_at.is_(None))
-                            .values(review_note=note, reviewer=actor, reviewed_at=utc_time())).rowcount
-        if count != 1:
+        row = _lock_evidence(conn, identity)
+        if row['reviewed_at'] is not None:
             raise HTTPException(409, '该证据已经复核')
+        report = row['report'] or {}
+        if report.get('signable') is False:
+            blockers = report.get('blockers') or []
+            detail = '；'.join(blockers)
+            raise HTTPException(409, '发布单存在盘点差额或待核盘点，不能签署。' + (detail and f'{detail}。' or ''))
+        conn.execute(evidence.update().where(evidence.c.id == identity).values(
+            review_note=note, reviewer=actor, reviewed_at=utc_time()))
         log(conn, actor, 'review', identity)
-        return found(conn, evidence, identity)
+        return dict(_lock_evidence(conn, identity))
+
+
+def submit_ledger(identity, ledger, actor):
+    with engine.connect() as conn:
+        row = conn.execute(select(evidence).where(evidence.c.id == identity)).mappings().first()
+        if row is None:
+            raise HTTPException(404, '找不到该记录')
+        payload = _evidence_case(conn, row)
+    entry = domain.check_late_ledger(payload, ledger, engine)
+    with engine.begin() as conn:
+        row = _lock_evidence(conn, identity)
+        if row['reviewed_at'] is not None:
+            raise HTTPException(409, '发布单已签署，补交盘点记录不能再入账')
+        report = row['report'] or {}
+        existing = (report.get('inventory') or {}).get('entries') or []
+        if any(item['stream'] == entry['stream'] and item['sequence'] == entry['sequence'] for item in existing):
+            raise HTTPException(409, '该分区位点的盘点账已经入账')
+        report = domain.append_ledger(report, entry)
+        digest = hashlib.sha256(canonical(report)).hexdigest()
+        conn.execute(evidence.update().where(evidence.c.id == identity)
+                     .values(report=report, digest=digest))
+        conn.execute(inventory_ledgers.insert().values(
+            evidence_id=identity, stream=entry['stream'], sequence=entry['sequence'],
+            signs=entry['signs'], submitted_by=actor, created_at=utc_time()))
+        log(conn, actor, 'submit_ledger', identity)
+        return dict(_lock_evidence(conn, identity))
+
+
+def list_ledgers(identity):
+    with engine.connect() as conn:
+        found(conn, evidence, identity)
+        rows = conn.execute(select(inventory_ledgers).where(inventory_ledgers.c.evidence_id == identity)
+                            .order_by(inventory_ledgers.c.id)).mappings()
+        return [dict(row) for row in rows]

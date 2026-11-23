@@ -1,5 +1,5 @@
-from sqlalchemy import (JSON, Column, ForeignKey, Integer, MetaData, String,
-                        Table, Text)
+from sqlalchemy import (JSON, BigInteger, Column, ForeignKey, Integer, MetaData,
+                        String, Table, Text)
 
 schema = MetaData()
 users = Table('accounts', schema,
@@ -32,6 +32,14 @@ evidence = Table('business_evidence', schema,
     Column('reviewer', String(40)),
     Column('review_note', String(500)),
     Column('reviewed_at', String(32)))
+inventory_ledgers = Table('inventory_ledger_bookings', schema,
+    Column('id', Integer, primary_key=True),
+    Column('evidence_id', ForeignKey('business_evidence.id'), nullable=False, index=True),
+    Column('stream', String(64), nullable=False),
+    Column('sequence', BigInteger, nullable=False),
+    Column('signs', JSON, nullable=False),
+    Column('submitted_by', String(40), nullable=False),
+    Column('created_at', String(32), nullable=False))
 audit = Table('audit_events', schema,
     Column('id', Integer, primary_key=True),
     Column('actor', String(40), nullable=False),

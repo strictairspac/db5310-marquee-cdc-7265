@@ -4,7 +4,7 @@ from sqlalchemy import text
 from src.config.settings import cache, engine
 from src.controllers.workflow import download
 from src.models.tables import audit, cases, evidence, runs
-from src.schemas.workflow import CaseForm, LoginForm, ReviewForm
+from src.schemas.workflow import CaseForm, LedgerForm, LoginForm, ReviewForm
 from src.services import domain, workflow
 from src.services.security import current_user, login, operator, reviewer
 
@@ -57,6 +57,16 @@ def list_evidence(_=Depends(current_user)):
 @router.get('/evidence/{identity}/download')
 def export_evidence(identity: int, _=Depends(current_user)):
     return download(identity)
+
+
+@router.get('/evidence/{identity}/ledgers')
+def list_evidence_ledgers(identity: int, _=Depends(current_user)):
+    return workflow.list_ledgers(identity)
+
+
+@router.post('/evidence/{identity}/ledgers')
+def submit_evidence_ledger(identity: int, form: LedgerForm, actor=Depends(operator)):
+    return workflow.submit_ledger(identity, form.ledger, actor)
 
 
 @router.post('/evidence/{identity}/review')

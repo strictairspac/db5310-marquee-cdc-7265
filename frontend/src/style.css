@@ -74,6 +74,8 @@ td { border-top:1px solid var(--line); min-width: 3.3rem; max-width: 35ch; }
 .empty { margin:0; padding:1.3rem; color:var(--muted); background:var(--soft); }
 summary { cursor:pointer; font-weight:600; color:var(--accent-dark); }
 .digest { word-break:break-all; }
+.ledger-form { margin-top: 1.5rem; }
+.ledger-form form { display: grid; gap: .8rem; }
 @media (min-width: 1280px) { .inspection .panel:has(> pre) { max-width: 65ch; } }
 @media (max-width: 1000px) {
   .workspace { display: block; }
